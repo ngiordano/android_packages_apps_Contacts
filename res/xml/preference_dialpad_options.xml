@@ -43,10 +43,11 @@
 		android:entryValues="@array/t9_sort_values"
 		android:dialogTitle="@string/t9_sort_title" />
     <PreferenceScreen
-        android:title="@string/speaker_proximity">
+        android:title="@string/speaker_proximity"
+        android:summary="@string/speaker_proximity_summary">
         <intent
             android:action="android.intent.action.MAIN"
-            android:targetPackage="net.androcom.dev.speakerproximity"
-            android:targetClass="net.androcom.dev.speakerproximity.SpeakerProximity" />            
+            android:targetPackage="com.android.cna.speakerproximity"
+            android:targetClass="com.android.cna.speakerproximity.SpeakerProximity" />            
     </PreferenceScreen>
 </PreferenceScreen>

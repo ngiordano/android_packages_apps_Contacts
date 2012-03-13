@@ -795,7 +795,7 @@ public class DialpadFragment extends Fragment
      * Returns preference value for T9Dialer
      */
     private boolean isT9On() {
-        return PreferenceManager.getDefaultSharedPreferences(getActivity()).getBoolean("t9_state", true);
+        return PreferenceManager.getDefaultSharedPreferences(getActivity()).getBoolean("t9_state", false);
     }
 
     /**

@@ -17,6 +17,8 @@
 <resources xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
 
+    <!-- CM Changes are put first to prevent problems on merge -->
+
     <string name="dialer_ui_title">Paramètres du clavier</string>
     <string name="dialer_ui_orientation_title">Auto-rotation</string>
     <string name="dialer_ui_orientation_summary">Utiliser le capteur pour passer du mode portrait au mode paysage</string>

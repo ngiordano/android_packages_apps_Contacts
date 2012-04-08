@@ -26,7 +26,9 @@ import android.app.Fragment;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.content.res.Resources;
+import android.database.ContentObserver;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -34,6 +36,7 @@ import android.media.AudioManager;
 import android.media.ToneGenerator;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.os.SystemProperties;
@@ -42,6 +45,7 @@ import android.provider.Contacts.Intents.Insert;
 import android.provider.Contacts.People;
 import android.provider.Contacts.Phones;
 import android.provider.Contacts.PhonesColumns;
+import android.provider.ContactsContract;
 import android.provider.Settings;
 import android.telephony.PhoneNumberUtils;
 import android.telephony.PhoneStateListener;
@@ -50,6 +54,7 @@ import android.text.Editable;
 import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.text.method.DialerKeyListener;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
@@ -99,6 +104,8 @@ public class DialpadFragment extends Fragment
         ViewPagerVisibilityListener {
     private static final String TAG = DialpadFragment.class.getSimpleName();
 
+    private static final boolean DEBUG = false;
+
     private static final String EMPTY_NUMBER = "";
 
     /** The length of DTMF tones in milliseconds */
@@ -125,11 +132,12 @@ public class DialpadFragment extends Fragment
     private ToneGenerator mToneGenerator;
     private Object mToneGeneratorLock = new Object();
     private View mDialpad;
-    private View mAdditionalButtonsRow;
 
     private View mSearchButton;
+    private View mMenuButton;
     private Listener mListener;
 
+    private View mDialButtonContainer;
     private View mDialButton;
     private ListView mDialpadChooser;
     private DialpadChooserAdapter mDialpadChooserAdapter;
@@ -143,6 +151,7 @@ public class DialpadFragment extends Fragment
     private T9Adapter mT9AdapterTop;
     private ViewSwitcher mT9Flipper;
     private LinearLayout mT9Top;
+    private boolean mContactsUpdated;
 
     /**
      * Regular expression prohibiting manual phone call. Can be empty, which means "no rule".
@@ -256,6 +265,13 @@ public class DialpadFragment extends Fragment
                 R.string.config_prohibited_phone_number_regexp);
     }
 
+    private ContentObserver mContactObserver = new ContentObserver(new Handler()) {
+        @Override
+        public void onChange(boolean selfChange) {
+            mContactsUpdated = true;
+        }
+    };
+
     @Override
     public View onCreateView(LayoutInflater inflater, ViewGroup container, Bundle savedState) {
         View fragmentView = inflater.inflate(R.layout.dialpad_fragment, container, false);
@@ -285,14 +301,30 @@ public class DialpadFragment extends Fragment
         }
         mT9Flipper = (ViewSwitcher) fragmentView.findViewById(R.id.t9flipper);
         mT9Top = (LinearLayout) fragmentView.findViewById(R.id.t9topbar);
+
+        PhoneNumberFormatter.setPhoneNumberFormattingTextWatcher(getActivity(), mDigits);
+
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        int minCellSize = (int) (56 * dm.density); // 56dip == minimum size of menu buttons
+        int cellCount = dm.widthPixels / minCellSize;
+        int fakeMenuItemWidth = dm.widthPixels / cellCount;
+        if (DEBUG) Log.d(TAG, "The size of fake menu buttons (in pixel): " + fakeMenuItemWidth);
+
         // Soft menu button should appear only when there's no hardware menu button.
-        final View overflowMenuButton = fragmentView.findViewById(R.id.overflow_menu);
-        if (overflowMenuButton != null) {
+        mMenuButton = fragmentView.findViewById(R.id.overflow_menu);
+        if (mMenuButton != null) {
+            mMenuButton.setMinimumWidth(fakeMenuItemWidth);
             if (ViewConfiguration.get(getActivity()).hasPermanentMenuKey()) {
-                overflowMenuButton.setVisibility(View.GONE);
+                // This is required for dialpad button's layout, so must not use GONE here.
+                mMenuButton.setVisibility(View.INVISIBLE);
             } else {
-                overflowMenuButton.setOnClickListener(this);
+                mMenuButton.setOnClickListener(this);
             }
+        }
+        mSearchButton = fragmentView.findViewById(R.id.searchButton);
+        if (mSearchButton != null) {
+            mSearchButton.setMinimumWidth(fakeMenuItemWidth);
+            mSearchButton.setOnClickListener(this);
         }
 
         // Check for the presence of the keypad
@@ -301,16 +333,8 @@ public class DialpadFragment extends Fragment
             setupKeypad(fragmentView);
         }
 
-        mAdditionalButtonsRow = fragmentView.findViewById(R.id.dialpadAdditionalButtons);
-
-        mSearchButton = mAdditionalButtonsRow.findViewById(R.id.searchButton);
-        if (mSearchButton != null) {
-            mSearchButton.setOnClickListener(this);
-        }
-
-        // Check whether we should show the onscreen "Dial" button.
-        mDialButton = mAdditionalButtonsRow.findViewById(R.id.dialButton);
-
+        mDialButtonContainer = fragmentView.findViewById(R.id.dialButtonContainer);
+        mDialButton = fragmentView.findViewById(R.id.dialButton);
         if (r.getBoolean(R.bool.config_show_onscreen_dial_button)) {
             mDialButton.setOnClickListener(this);
         } else {
@@ -318,9 +342,11 @@ public class DialpadFragment extends Fragment
             mDialButton = null;
         }
 
-        mDelete = mAdditionalButtonsRow.findViewById(R.id.deleteButton);
-        mDelete.setOnClickListener(this);
-        mDelete.setOnLongClickListener(this);
+        mDelete = fragmentView.findViewById(R.id.deleteButton);
+        if (mDelete != null) {
+            mDelete.setOnClickListener(this);
+            mDelete.setOnLongClickListener(this);
+        }
 
         mDialpad = fragmentView.findViewById(R.id.dialpad);  // This is null in landscape mode.
 
@@ -336,6 +362,8 @@ public class DialpadFragment extends Fragment
         mDialpadChooser.setOnItemClickListener(this);
 
         configureScreenFromIntent(getActivity().getIntent());
+
+        updateFakeMenuButtonsVisibility(mShowOptionsMenu);
 
         return fragmentView;
     }
@@ -506,16 +534,27 @@ public class DialpadFragment extends Fragment
     public void onResume() {
         super.onResume();
 
-        if (sT9Search == null && isT9On()) {
+        if ((sT9Search == null && isT9On()) || mContactsUpdated) {
             Thread loadContacts = new Thread(new Runnable() {
                 public void run () {
                     sT9Search = new T9Search(getActivity());
                 }
             });
             loadContacts.start();
+            if (mContactsUpdated) {
+                mContactsUpdated = false;
+                onLongClick(mDelete);
+                mT9Adapter = null;
+                mT9AdapterTop = null;
+                mT9ListTop.setAdapter(mT9AdapterTop);
+                mT9List.setAdapter(mT9Adapter);
+            }
         }
 
-        PhoneNumberFormatter.setPhoneNumberFormattingTextWatcher(getActivity(), mDigits);
+        if (isT9On()) {
+            getActivity().getContentResolver().unregisterContentObserver(mContactObserver);
+        }
+
         hideT9();
         // Query the last dialed number. Do it first because hitting
         // the DB is 'slow'. This call is asynchronous.
@@ -600,12 +639,17 @@ public class DialpadFragment extends Fragment
         // TODO: I wonder if we should not check if the AsyncTask that
         // lookup the last dialed number has completed.
         mLastNumberDialed = EMPTY_NUMBER;  // Since we are going to query again, free stale number.
+        if (isT9On()) {
+            getActivity().getContentResolver().registerContentObserver(
+                    ContactsContract.Contacts.CONTENT_URI, true, mContactObserver);
+        }
     }
 
     @Override
     public void onCreateOptionsMenu(Menu menu, MenuInflater inflater) {
         super.onCreateOptionsMenu(menu, inflater);
-        if (mShowOptionsMenu && ViewConfiguration.get(getActivity()).hasPermanentMenuKey() &&
+        final boolean isLandscape = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+        if (mShowOptionsMenu && (ViewConfiguration.get(getActivity()).hasPermanentMenuKey() || isLandscape) &&
                 isLayoutReady() && mDialpadChooser != null) {
             inflater.inflate(R.menu.dialpad_options, menu);
         }
@@ -613,8 +657,9 @@ public class DialpadFragment extends Fragment
 
     @Override
     public void onPrepareOptionsMenu(Menu menu) {
+        final boolean isLandscape = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
         // Hardware menu key should be available and Views should already be ready.
-        if (mShowOptionsMenu && ViewConfiguration.get(getActivity()).hasPermanentMenuKey() &&
+        if (mShowOptionsMenu && (ViewConfiguration.get(getActivity()).hasPermanentMenuKey() || isLandscape) &&
                 isLayoutReady() && mDialpadChooser != null) {
              setupMenuItems(menu);
         }
@@ -765,7 +810,7 @@ public class DialpadFragment extends Fragment
                         mT9List.setAdapter(mT9Adapter);
                     }
                     mT9AdapterTop.add(result.getTopContact());
-                    if (result.getNumResults()>  1) {
+                    if (result.getNumResults() > 1) {
                         mT9Toggle.setVisibility(View.VISIBLE);
                     } else {
                         mT9Toggle.setVisibility(View.GONE);
@@ -795,7 +840,7 @@ public class DialpadFragment extends Fragment
      * Returns preference value for T9Dialer
      */
     private boolean isT9On() {
-        return PreferenceManager.getDefaultSharedPreferences(getActivity()).getBoolean("t9_state", false);
+        return PreferenceManager.getDefaultSharedPreferences(getActivity()).getBoolean("t9_state", true);
     }
 
     /**
@@ -1233,7 +1278,8 @@ public class DialpadFragment extends Fragment
                 mDigits.setVisibility(View.GONE);
             }
             if (mDialpad != null) mDialpad.setVisibility(View.GONE);
-            mAdditionalButtonsRow.setVisibility(View.GONE);
+            if (mDialButtonContainer != null) mDialButtonContainer.setVisibility(View.GONE);
+
             mDialpadChooser.setVisibility(View.VISIBLE);
 
             // Instantiate the DialpadChooserAdapter and hook it up to the
@@ -1258,7 +1304,7 @@ public class DialpadFragment extends Fragment
                 mDigits.setVisibility(View.VISIBLE);
             }
             if (mDialpad != null) mDialpad.setVisibility(View.VISIBLE);
-            mAdditionalButtonsRow.setVisibility(View.VISIBLE);
+            if (mDialButtonContainer != null) mDialButtonContainer.setVisibility(View.VISIBLE);
             mDialpadChooser.setVisibility(View.GONE);
         }
     }
@@ -1663,7 +1709,34 @@ public class DialpadFragment extends Fragment
     }
 
     @Override
-    public void onVisibilityChanged(boolean visible) {
-        mShowOptionsMenu = visible;
+    public void onVisibilityChanged(boolean fragmentVisible) {
+        mShowOptionsMenu = fragmentVisible;
+        updateFakeMenuButtonsVisibility(fragmentVisible);
+    }
+
+    /**
+     * Update visibility of the search button and menu button at the bottom of dialer screen, which
+     * should be invisible when bottom ActionBar's real items are available and be visible
+     * otherwise.
+     *
+     * @param visible True when visible.
+     */
+    public void updateFakeMenuButtonsVisibility(boolean visible) {
+        if (DEBUG) Log.d(TAG, "updateFakeMenuButtonVisibility(" + visible + ")");
+
+        if (mSearchButton != null) {
+            if (visible) {
+                mSearchButton.setVisibility(View.VISIBLE);
+            } else {
+                mSearchButton.setVisibility(View.INVISIBLE);
+            }
+        }
+        if (mMenuButton != null) {
+            if (visible && !ViewConfiguration.get(getActivity()).hasPermanentMenuKey()) {
+                mMenuButton.setVisibility(View.VISIBLE);
+            } else {
+                mMenuButton.setVisibility(View.INVISIBLE);
+            }
+        }
     }
 }
